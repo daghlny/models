@@ -1,23 +1,39 @@
 # -*- coding: utf-8 -*-
+import os
 import time
 import math
+import contextlib
 import torch
 import transformers
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 from collections import OrderedDict
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
 from datasets import load_dataset_builder, load_dataset
 from torch.optim import AdamW
+import torch.distributed as dist
 import numpy as np
 
+assert torch.cuda.is_available()
 
-# 自动选择最优设备
-device = 'cpu' if not torch.cuda.is_available() else 'cuda'
-print(f'current device is `{device}`')
+# device selection and distributed process group
+worldsize = int(os.environ.get("WORLD_SIZE", "1"))
+is_distributed = worldsize > 1
+if is_distributed:
+  dist.init_process_group(backend='nccl')
+  localrank = int(os.environ["LOCAL_RANK"])
+  globalrank = int(os.environ["RANK"])
+  torch.cuda.set_device(localrank)
+  device = torch.device(f"cuda:{localrank}")
+else:
+  localrank = 0
+  globalrank = 0
+  device = torch.device("cuda")
+print(f'current device is {device}, world size is {worldsize}')
 
-# config
+# model config
 d_model = 768
 d_vocab = 50257
 d_context = 2048
@@ -111,7 +127,7 @@ class Transformer(nn.Module):
     B,T = x.shape
     if T > d_context:
         raise ValueError(f"输入序列长度 T={T} 超出了最大上下文长度 d_context={d_context}")
-    x = self.wte(x)+self.wpe(torch.arange(0, T, device=device))
+    x = self.wte(x)+self.wpe(torch.arange(0, T, device=x.device))
     x = self.Drop(x)
     for block in self.h:
       x = block(x, padding_mask=padding_mask)
@@ -160,7 +176,8 @@ class FineWebDataset(IterableDataset):
         }
 
 batch_size = 32 # maximum batch size accordding to HBM
-accumulation_steps = (2**19)//d_context//batch_size
+tokens_per_optim_step = 2**19
+accumulation_steps = max(1, tokens_per_optim_step // (d_context * batch_size * worldsize))
 print(f'accumulation_steps={accumulation_steps}')
 epoch_nums = 10
 warmup_steps = 10000
@@ -182,13 +199,16 @@ def get_lr(step, max_lr=6e-4):
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 finewebRawData = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
-dataset = FineWebDataset(finewebRawData, tokenizer)
+sharedRawData = finewebRawData.shard(num_shards=worldsize, index=globalrank)
+dataset = FineWebDataset(sharedRawData, tokenizer)
 dataloader = DataLoader(dataset, batch_size=batch_size)
 
 
 gpt2 = GPT2()
 gpt2 = gpt2.to(device)
-gpt2.compile()
+gpt2 = torch.compile(gpt2)
+if is_distributed:
+  gpt2 = DistributedDataParallel(gpt2, device_ids=[localrank])
 #dataloader = DataLoaderInLocalFile('input.txt', batch_size=batch_size)
 optimizer = AdamW(gpt2.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=True)
 optimizer.zero_grad(set_to_none=True)
@@ -200,66 +220,62 @@ global_step = 0
 t1 = time.time()
 
 accu_loss = 0
+interval_tokens = 0
+global_tokens = 0
 monitor_steps = 200
-for epoch in range(epoch_nums):
-  for batch in dataloader:
-    x, y = batch["input_ids"], batch["labels"]
-    x = x.to(device, dtype=torch.long) # 确保是整数
-    y = y.to(device, dtype=torch.long) # 确保是整数
+data_iter = iter(dataloader)
+while global_step < max_steps:
+  try:
+    batch = next(data_iter)
+  except StopIteration:
+    data_iter = iter(dataloader)
+    batch = next(data_iter)
 
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-      logits = gpt2(x)
-      #loss = F.cross_entropy(logits.permute(0,2,1), y)
-      # 将 logits 从 [B, T, V] 展平成 [B*T, V]
-      # 将 y 从 [B, T] 展平成 [B*T]
-      loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-      accu_loss += loss.item()
-      loss = loss/accumulation_steps
+  x, y = batch["input_ids"], batch["labels"]
+  x = x.to(device, dtype=torch.long)
+  y = y.to(device, dtype=torch.long)
+
+  is_accumulation_step = (step + 1) % accumulation_steps == 0
+
+  with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    logits = gpt2(x)
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+    accu_loss += loss.item()
+    loss = loss / accumulation_steps
+
+  sync_ctx = gpt2.no_sync if (is_distributed and not is_accumulation_step) else contextlib.nullcontext
+  with sync_ctx():
     loss.backward()
 
-    if (step+1) % accumulation_steps == 0:
-      global_step += 1
-      lr = get_lr(global_step)
-      for group in optimizer.param_groups:
-        group['lr'] = lr   # 手动注入
-      torch.nn.utils.clip_grad_norm_(gpt2.parameters(), max_norm=1.0)
-      optimizer.step()
-      optimizer.zero_grad(set_to_none=True)
+  if is_accumulation_step:
+    global_step += 1
+    lr = get_lr(global_step)
+    for group in optimizer.param_groups:
+      group['lr'] = lr
+    torch.nn.utils.clip_grad_norm_(gpt2.parameters(), max_norm=1.0)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
 
-    step += 1
-    trained += batch_size*d_context
-    if step % monitor_steps == 0:
-      torch.cuda.synchronize()
+  step += 1
+  batch_tokens = x.numel()
+  trained += batch_tokens
+  interval_tokens += batch_tokens
+  if step % monitor_steps == 0:
+    torch.cuda.synchronize()
+    loss_t = torch.tensor(accu_loss / monitor_steps, device=device, dtype=torch.float64)
+    tok_t = torch.tensor(interval_tokens, device=device, dtype=torch.float64)
+    if is_distributed:
+      dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+      dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+      loss_t /= worldsize
+    if localrank == 0:
       t2 = time.time()
-      print(f'step:{global_step: 6d} | tokens:{trained: 12.3e} | loss:{accu_loss/(monitor_steps):06.3f} | lr: {lr: .6f} | speed: {batch_size*monitor_steps*d_context / (t2-t1):6.0f} tokens/sec')
-      accu_loss = 0
+      global_tokens += int(tok_t.item())
+      print(f'step:{global_step: 6d} | tokens:{global_tokens: 12.3e} | loss:{loss_t.item():06.3f} | lr: {lr: .6f} | speed: {tok_t.item() / (t2-t1):6.0f} tokens/sec')
       t1 = time.time()
+    accu_loss = 0
+    interval_tokens = 0
 
-def generate(text, my_model=None, max_tokens=d_context, temperature=0.7, top_k=40):
-  assert my_model is not None, "my_model is None"
-  input_ids = torch.tensor(tokenizer.encode(text)).unsqueeze(0).to(device)
-  my_model.eval()
-  with torch.no_grad():
-    for _ in range(max_tokens):
-      if input_ids.shape[1] >= d_context:
-        print(f'BREAK: require too much tokens')
-        break
-      logits = my_model(input_ids)
-      logits = logits[:,-1,:]
-      logits = logits/temperature
-      if top_k > 0:
-        # 找到第 k 大的那个值
-        v, _ = torch.topk(logits, top_k)
-        min_val = v[:, -1].unsqueeze(1)
-        # 将小于第 k 大值的 logits 设为负无穷，这样 softmax 后概率为 0
-        logits = torch.where(
-            logits < min_val,
-            torch.tensor(float('-inf')).to(device),
-            logits
-        )
-      probs = F.softmax(logits, dim=-1)
-      newidx = torch.multinomial(probs, num_samples=1)
-      input_ids = torch.cat((input_ids, newidx), dim=1)
-    print(f'{tokenizer.decode(input_ids[0].tolist())}')
-
-generate("I am your father. Where are you?")
+# gracefully byebye
+if is_distributed:
+  dist.destroy_process_group()
