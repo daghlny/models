@@ -212,6 +212,7 @@ if is_distributed:
 #dataloader = DataLoaderInLocalFile('input.txt', batch_size=batch_size)
 optimizer = AdamW(gpt2.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=True)
 optimizer.zero_grad(set_to_none=True)
+lr = optimizer.param_groups[0]["lr"]
 
 gpt2.train()
 trained = 0
