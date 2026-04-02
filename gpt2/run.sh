@@ -10,6 +10,7 @@ if [[ "$NPROC" -lt 1 ]]; then
   exit 1
 fi
 
+export HF_ENDPOINT="https://hf-mirror.com"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 if [[ "$NPROC" -eq 1 ]]; then

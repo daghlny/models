@@ -15,8 +15,15 @@ from datasets import load_dataset_builder, load_dataset
 from torch.optim import AdamW
 import torch.distributed as dist
 import numpy as np
+from datetime import datetime
 
 assert torch.cuda.is_available()
+
+current_time = datetime.now().strftime("%Y%m%d_%H:%M:%S")
+logfile = open(f'./{current_time}.gpt2_train.logs', 'a', encoding='utf-8')
+
+def logs(s: str):
+  logfile.write(s+"\n")
 
 # device selection and distributed process group
 worldsize = int(os.environ.get("WORLD_SIZE", "1"))
@@ -31,17 +38,18 @@ else:
   localrank = 0
   globalrank = 0
   device = torch.device("cuda")
-print(f'current device is {device}, world size is {worldsize}')
+print(f'is_distributed: {is_distributed} current device is {device}, world size is {worldsize}')
 
 # model config
 d_model = 768
 d_vocab = 50257
-d_context = 2048
+d_context = 1024 # this is different from original GPT2 model
 head_cnt = 12
 d_head = d_model//head_cnt
 
 masked = torch.triu(torch.full((d_context,d_context), float('-inf')), diagonal=1).to(device) #(T,T)
 
+# model definition
 class Attention(nn.Module):
   def __init__(self):
     super().__init__()
@@ -155,6 +163,7 @@ class GPT2(nn.Module):
     x = self.lm_head(x) # (B,T,V)
     return x
 
+# data loader
 class FineWebDataset(IterableDataset):
   def __init__(self, hf_dataset, tokenizer, max_length=d_context):
     self.dataset = hf_dataset
@@ -175,13 +184,31 @@ class FineWebDataset(IterableDataset):
             "labels": torch.tensor(chunk[1:], dtype=torch.long)
         }
 
-batch_size = 32 # maximum batch size accordding to HBM
+def estimate_batch_size(device, seq_len=d_context, safety_factor=0.75):
+    props = torch.cuda.get_device_properties(device)
+    total_mem = props.total_memory  # bytes
+    # model parameters 
+    param_mem = sum(p.numel() * p.element_size() for p in gpt2.parameters())
+    # AdamW 优化器状态：fp32 master weights + 2个momentum，约 3× param_mem（fp32）
+    optimizer_mem = param_mem * (4 / 2) * 3  # 换算成 fp32 再乘 3
+    # 每个样本激活内存（GPT-2 经验值，bf16 下约 1MB per token 再乘 layers）
+    # 粗略估算：2 bytes × seq_len × d_model × 12层 × 前向+反向(×2)
+    bytes_per_sample = 2 * seq_len * d_model * 12 * 2
+    available = total_mem * safety_factor - param_mem - optimizer_mem
+    batch = max(1, int(available // bytes_per_sample))
+    # 取 2 的幂次（对 CUDA 友好）
+    batch = 2 ** int(math.log2(batch))
+    print(f"esitmated batch size of {device} is {batch}")
+    return batch
+
+# train config
+batch_size = estimate_batch_size(device) # maximum batch size accordding to HBM
 tokens_per_optim_step = 2**19
 accumulation_steps = max(1, tokens_per_optim_step // (d_context * batch_size * worldsize))
 print(f'accumulation_steps={accumulation_steps}')
 epoch_nums = 10
-warmup_steps = 10000
-max_steps =    1000000
+max_steps = 40*(10**9) // tokens_per_optim_step
+warmup_steps = max_steps*0.01
 
 def get_lr(step, max_lr=6e-4):
   min_lr = max_lr*0.1
@@ -194,22 +221,45 @@ def get_lr(step, max_lr=6e-4):
   ratio = 0.5*(math.cos(ratio*math.pi)+1)
   return min_lr + ratio*(max_lr-min_lr)
 
+def save_checkpoint(global_step, model, optimizer):
+  torch.save({
+    "global_step": global_step,
+    "model": (model.module if is_distributed else model).state_dict(),
+    "optimizer": optimizer.state_dict(),
+  }, f"checkpoint_step{global_step}.pt")
+
+def save_finished_checkpoint(model, optimizer):
+  torch.save({
+    "global_step": -1,
+    "model": (model.module if is_distributed else model).state_dict(),
+    "optimizer": optimizer.state_dict(),
+  }, f"checkpoint_finished.pt")
+
+def load_checkpoint(filename):
+  ckpt = torch.load(filename, map_location=device)
+  gpt2.load_state_dict(ckpt["model"])
+  optimizer.load_state_dict(ckpt["optimizer"])
+  return ckpt["global_step"]
+
 # Data
 # use name="sample-10BT" to use the 10BT sample
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
+print(f"tokenzier is loaded")
+tokenizer.model_max_length = d_context
 tokenizer.pad_token = tokenizer.eos_token
 finewebRawData = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+print(f"dataset is loaded")
 sharedRawData = finewebRawData.shard(num_shards=worldsize, index=globalrank)
 dataset = FineWebDataset(sharedRawData, tokenizer)
 dataloader = DataLoader(dataset, batch_size=batch_size)
 
-
 gpt2 = GPT2()
 gpt2 = gpt2.to(device)
-gpt2 = torch.compile(gpt2)
 if is_distributed:
   gpt2 = DistributedDataParallel(gpt2, device_ids=[localrank])
-#dataloader = DataLoaderInLocalFile('input.txt', batch_size=batch_size)
+gpt2 = torch.compile(gpt2)
+print(f"gpt2 model is compiled")
+
 optimizer = AdamW(gpt2.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=True)
 optimizer.zero_grad(set_to_none=True)
 lr = optimizer.param_groups[0]["lr"]
@@ -224,7 +274,12 @@ accu_loss = 0
 interval_tokens = 0
 global_tokens = 0
 monitor_steps = 200
+save_step_interval, last_save_step = 1000, 0
 data_iter = iter(dataloader)
+
+# global_step = load_checkpoint("checkpoint_step100000.pt")
+
+print(f"ready? train loop is starting")
 while global_step < max_steps:
   try:
     batch = next(data_iter)
@@ -257,6 +312,10 @@ while global_step < max_steps:
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
+  if global_step - last_save_step > save_step_interval:
+    save_checkpoint(global_step, gpt2, optimizer) 
+    last_save_step = global_step
+
   step += 1
   batch_tokens = x.numel()
   trained += batch_tokens
@@ -276,6 +335,10 @@ while global_step < max_steps:
       t1 = time.time()
     accu_loss = 0
     interval_tokens = 0
+
+print(f"training is over, start to save model parameters")
+save_finished_checkpoint(gpt2, optimizer)
+print(f"saving is over, bye!")
 
 # gracefully byebye
 if is_distributed:
