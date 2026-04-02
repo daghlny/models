@@ -45,9 +45,8 @@ d_model = 768
 d_vocab = 50257
 d_context = 1024 # this is different from original GPT2 model
 head_cnt = 12
+layer_num = 12
 d_head = d_model//head_cnt
-
-masked = torch.triu(torch.full((d_context,d_context), float('-inf')), diagonal=1).to(device) #(T,T)
 
 # model definition
 class Attention(nn.Module):
@@ -55,7 +54,7 @@ class Attention(nn.Module):
     super().__init__()
     self.c_attn = nn.Linear(d_model, 3*d_model) # Q,K,V
     self.c_proj = nn.Linear(d_model, d_model) # W_o
-    self.Drop = nn.Dropout(0.05)
+    self.drop = nn.Dropout(0.1)
 
   def forward(self, x):
     B,T,C = x.shape # T maybe != d_context
@@ -66,11 +65,11 @@ class Attention(nn.Module):
     v = v.view(B,T,head_cnt,d_head).transpose(1,2).contiguous()
     attn = F.scaled_dot_product_attention(
         q, k, v,
-        dropout_p=0.05 if self.training else 0.0,
+        dropout_p=0.1 if self.training else 0.0,
         is_causal=True
     )
     attn = attn.contiguous().reshape(B,T,C) # (B,T,C)
-    return self.c_proj(attn) # (B,T,C)
+    return self.drop(self.c_proj(attn)) # (B,T,C)
 
 class Block(nn.Module):
   def __init__(self):
@@ -103,7 +102,7 @@ class Transformer(nn.Module):
     self.wpe = nn.Embedding(d_context, d_model)
     self.Drop = nn.Dropout(0.1)
     self.h = nn.ModuleList([
-        Block() for _ in range (12)
+        Block() for _ in range (layer_num)
     ])
     self.ln_f = nn.LayerNorm(d_model)
 
@@ -125,6 +124,11 @@ class GPT2(nn.Module):
     self.lm_head = nn.Linear(d_model, d_vocab, bias=False)
     self.lm_head.weight = self.transformer.wte.weight
     self.apply(self._init_weights)
+    # scale residual projections: 1/sqrt(2*n_layer) per GPT-2 paper
+    residual_std = 0.02 / math.sqrt(2 * layer_num)
+    for block in self.transformer.h:
+      nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=residual_std)
+      nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=residual_std)
 
   def _init_weights(self, module):
     if isinstance(module, nn.Linear):
