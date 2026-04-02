@@ -57,41 +57,17 @@ class Attention(nn.Module):
     self.c_proj = nn.Linear(d_model, d_model) # W_o
     self.Drop = nn.Dropout(0.05)
 
-  def forward(self, x, padding_mask=None):
+  def forward(self, x):
     B,T,C = x.shape # T maybe != d_context
     qkv = self.c_attn(x) # (B,T,3*C)
     q,k,v = torch.split(qkv, qkv.size(-1)//3, dim=-1) #(B,T,C) * 3
     q = q.view(B,T,head_cnt,d_head).transpose(1,2).contiguous()    #(B,H,T,c) 这里 c=C/H
     k = k.view(B,T,head_cnt,d_head).transpose(1,2).contiguous()
     v = v.view(B,T,head_cnt,d_head).transpose(1,2).contiguous()
-    #scores = torch.matmul(q,k.transpose(-1,-2))/(d_head ** 0.5) + masked[:T, :T]
-    #scores = F.softmax(scores, dim=-1) #(B,H,T,T)
-    #scores = self.Drop(scores)
-    #attn = torch.matmul(scores, v).transpose(1,2) #(B,H,T,c) -> (B,T,H,c)
-    attn_masks = None
-    if padding_mask is not None:
-      # ① 因果掩码：(1, 1, T, T)，上三角为 -inf
-      causal = masked[:T, :T]
-      causal = torch.triu(
-        torch.full((T, T), float('-inf'), device=x.device, dtype=torch.float32),
-        diagonal=1
-      ).unsqueeze(0).unsqueeze(0)
-
-      # ② padding 掩码：(B, 1, 1, T)，padding 位置为 -inf，作用在 key 维度
-      #    padding_mask: 1=真实 token, 0=padding
-      key_pad = torch.where(
-        padding_mask.bool().unsqueeze(1).unsqueeze(2),          # (B, 1, 1, T)
-        torch.zeros(1, device=x.device, dtype=torch.float32),   # 真实 token → 0
-        torch.full((1,), float('-inf'), device=x.device, dtype=torch.float32)  # padding → -inf
-      )
-      # ③ 合并两个掩码，并对齐 dtype（autocast 下 q 可能是 bfloat16）
-      attn_masks = (causal + key_pad).to(dtype=q.dtype)  # (B, 1, T, T)
-
     attn = F.scaled_dot_product_attention(
         q, k, v,
-        attn_mask=attn_masks,
         dropout_p=0.05 if self.training else 0.0,
-        is_causal=(attn_masks is None)
+        is_causal=True
     )
     attn = attn.contiguous().reshape(B,T,C) # (B,T,C)
     return self.c_proj(attn) # (B,T,C)
@@ -109,10 +85,10 @@ class Block(nn.Module):
         "dropout": nn.Dropout(0.1)
     }))
 
-  def forward(self, x, padding_mask=None):
+  def forward(self, x):
     residual = x
     x = self.ln_1(x) # layer norm
-    x = self.attn(x, padding_mask=padding_mask) # attention
+    x = self.attn(x) # attention
     x = x+residual
     residual = x
     x = self.ln_2(x) # layer norm
@@ -131,14 +107,14 @@ class Transformer(nn.Module):
     ])
     self.ln_f = nn.LayerNorm(d_model)
 
-  def forward(self, x, padding_mask=None):
+  def forward(self, x):
     B,T = x.shape
     if T > d_context:
         raise ValueError(f"输入序列长度 T={T} 超出了最大上下文长度 d_context={d_context}")
     x = self.wte(x)+self.wpe(torch.arange(0, T, device=x.device))
     x = self.Drop(x)
     for block in self.h:
-      x = block(x, padding_mask=padding_mask)
+      x = block(x)
     x = self.ln_f(x)
     return x
 
@@ -158,8 +134,8 @@ class GPT2(nn.Module):
     elif isinstance(module, nn.Embedding):
       nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-  def forward(self, x, padding_mask=None):
-    x = self.transformer(x, padding_mask=padding_mask) # (B,T,C)
+  def forward(self, x):
+    x = self.transformer(x) # (B,T,C)
     x = self.lm_head(x) # (B,T,V)
     return x
 
